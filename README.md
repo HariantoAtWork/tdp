@@ -40,6 +40,41 @@ silicon, not the handheld's cooling. The real limits for the GPD WIN 5:
 `tdp` maps 10 discrete steps onto that envelope, caps at GPD's own 75 W
 slider maximum, and requires an explicit `--force` to go higher.
 
+## Install
+
+One-liner (NixOS, Ubuntu/Debian, Alpine) — installs `tdp`, `ryzenadj`, and a
+boot oneshot that applies **step 5 (55 W)** by default:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/HariantoAtWork/tdp/main/install.sh | sudo bash
+```
+
+Useful flags:
+
+```bash
+# boot at 45 W instead
+curl -fsSL …/install.sh | sudo bash -s -- --step 4
+
+# binary only (no systemd / OpenRC unit)
+curl -fsSL …/install.sh | sudo bash -s -- --no-service
+
+# remove
+curl -fsSL …/install.sh | sudo bash -s -- --uninstall
+```
+
+| Distro | Binary | ryzenadj | Boot service |
+|---|---|---|---|
+| **NixOS** | `/usr/local/bin/tdp` | `nix profile` / `nix-env` | systemd oneshot + optional `/etc/nixos/tdp.nix` |
+| **Ubuntu/Debian** | `/usr/local/bin/tdp` | built from source | systemd oneshot |
+| **Alpine** | `/usr/local/bin/tdp` | built from source | OpenRC oneshot |
+
+On NixOS the installer also writes `/etc/nixos/tdp.nix`. To make it fully
+declarative: add `imports = [ ./tdp.nix ];` to `configuration.nix`, then
+`sudo nixos-rebuild switch`.
+
+> Step **10** is never installed as a boot default. Raise it interactively
+> with `tdp set 10 --force` only.
+
 ## The ladder
 
 | Step | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
@@ -69,14 +104,14 @@ tdp watch        # live Tctl / GPU-watt / VRAM readout
   (`--stapm-limit`, `--slow-limit`, `--fast-limit`), resolved from `PATH`
   or via `nix run nixpkgs#ryzenadj --`.
 - Reads live temperature / GPU power from `k10temp` and `amdgpu` hwmon.
-- Settings are **runtime-only** and reset on reboot (for persistence, add a
-  systemd oneshot unit).
+- Manual `tdp set` is **runtime-only** and resets on reboot unless the
+  installer (or a NixOS module) enabled the boot oneshot.
 
 ## Requirements
 
 - GPD WIN 5 (or any AMD "Strix Halo" machine; the ladder is WIN 5-specific).
 - root (or sudo) to write SMU power limits.
-- `ryzenadj` — install it, or let the script fetch it via `nix run`.
+- `ryzenadj` — provided by the installer, or via `nix run nixpkgs#ryzenadj`.
 
 ## Safety notes
 
@@ -85,14 +120,6 @@ tdp watch        # live Tctl / GPU-watt / VRAM readout
   real speed gain once you're already pinned at Tjmax.
 - **Use the 180 W barrel-jack PSU** for high-TDP use. USB-C input (100 W)
   caps the system around 65 W and can brownout-shutdown above that.
-
-## NixOS
-
-```nix
-environment.systemPackages = [ (pkgs.writeShellScriptBin "tdp" (builtins.readFile ./tdp)) ];
-```
-
-Or just run the script directly: `./tdp set 5`.
 
 ## License
 
