@@ -64,7 +64,7 @@ curl -fsSL …/install.sh | sudo bash -s -- --uninstall
 
 | Distro | Binary | ryzenadj | Boot service |
 |---|---|---|---|
-| **NixOS** | `/usr/local/bin/tdp` | `nix profile` / `nix-env` | via `/etc/nixos/tdp.nix` (needs rebuild) |
+| **NixOS** | `/usr/local/bin/tdp` + `~/.local/bin/tdp` | `nix profile` / `nix-env` | via `/etc/nixos/tdp.nix` (needs rebuild) |
 | **Ubuntu/Debian** | `/usr/local/bin/tdp` | built from source | systemd oneshot (immediate) |
 | **Alpine** | `/usr/local/bin/tdp` | built from source | OpenRC oneshot (immediate) |
 

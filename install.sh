@@ -111,6 +111,7 @@ do_uninstall() {
   w "removing tdp…"
   rm -f "$BIN"
   rm -rf "$SHARE"
+  rm -f "${HOME:-/root}/.local/bin/tdp"
   if [[ "$INIT" == "systemd" ]]; then
     systemctl disable --now "$UNIT_NAME.service" 2>/dev/null || true
     rm -f "/etc/systemd/system/${UNIT_NAME}.service"
@@ -204,6 +205,15 @@ install_binary() {
   install -Dm644 "$tmp" "$SHARE/tdp"   # kept for the NixOS module to read
   rm -f "$tmp"
   w "✔ installed $BIN"
+
+  # NixOS does not put /usr/local/bin on PATH by default. Drop a symlink into
+  # ~/.local/bin (usually already on PATH) so `tdp` works before rebuild.
+  if [[ "$OS" == "nixos" ]]; then
+    local lbin="${HOME:-/root}/.local/bin"
+    mkdir -p "$lbin"
+    ln -sfn "$BIN" "$lbin/tdp"
+    w "✔ linked $lbin/tdp  (NixOS PATH convenience)"
+  fi
 }
 
 # ---- boot units -----------------------------------------------------------
