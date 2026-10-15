@@ -64,13 +64,19 @@ curl -fsSL …/install.sh | sudo bash -s -- --uninstall
 
 | Distro | Binary | ryzenadj | Boot service |
 |---|---|---|---|
-| **NixOS** | `/usr/local/bin/tdp` | `nix profile` / `nix-env` | systemd oneshot + optional `/etc/nixos/tdp.nix` |
-| **Ubuntu/Debian** | `/usr/local/bin/tdp` | built from source | systemd oneshot |
-| **Alpine** | `/usr/local/bin/tdp` | built from source | OpenRC oneshot |
+| **NixOS** | `/usr/local/bin/tdp` | `nix profile` / `nix-env` | via `/etc/nixos/tdp.nix` (needs rebuild) |
+| **Ubuntu/Debian** | `/usr/local/bin/tdp` | built from source | systemd oneshot (immediate) |
+| **Alpine** | `/usr/local/bin/tdp` | built from source | OpenRC oneshot (immediate) |
 
-On NixOS the installer also writes `/etc/nixos/tdp.nix`. To make it fully
-declarative: add `imports = [ ./tdp.nix ];` to `configuration.nix`, then
-`sudo nixos-rebuild switch`.
+On NixOS, `/etc/systemd` is read-only, so the installer writes
+`/etc/nixos/tdp.nix` and you enable it with:
+
+```bash
+curl -fsSL …/install.sh | sudo bash -s -- --rebuild
+# (adds imports = [ ./tdp.nix ]; and runs nixos-rebuild switch)
+```
+
+Or edit `configuration.nix` yourself and `sudo nixos-rebuild switch`.
 
 > Step **10** is never installed as a boot default. Raise it interactively
 > with `tdp set 10 --force` only.
