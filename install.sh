@@ -275,11 +275,11 @@ install_nixos_module() {
 # Wired into configuration.nix via:  imports = [ ./tdp.nix ];
 { pkgs, ... }:
 let
-  tdpPkg = pkgs.writeShellApplication {
-    name = "tdp";
-    runtimeInputs = [ pkgs.ryzenadj pkgs.gawk pkgs.coreutils pkgs.gnugrep pkgs.gnused ];
-    text = builtins.readFile $SHARE/tdp;
-  };
+  # writeShellScriptBin (not writeShellApplication): full bash program; ShellCheck
+  # via writeShellApplication fails the nixos-rebuild.
+  tdpPkg = pkgs.writeShellScriptBin "tdp" (
+    builtins.readFile $SHARE/tdp
+  );
 in
 {
   environment.systemPackages = [ tdpPkg pkgs.ryzenadj ];
@@ -288,6 +288,7 @@ in
     description = "Set Strix Halo TDP ladder step at boot";
     wantedBy = [ "multi-user.target" ];
     after = [ "multi-user.target" ];
+    path = [ pkgs.ryzenadj pkgs.gawk pkgs.coreutils pkgs.gnugrep pkgs.gnused ];
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;
