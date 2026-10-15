@@ -1,0 +1,216 @@
+#!/usr/bin/env bash
+#
+# tdp — a 1-to-10 TDP slider for the GPD WIN 5 (AMD Ryzen AI Max+ 395 "Strix Halo").
+#
+# Maps 10 discrete steps onto the safe power envelope for *this chassis*, using
+# ryzenadj. This is the Linux/NixOS equivalent of GPD's Windows "Motion
+# Assistant" TDP slider, but with a hard ceiling based on real data:
+#
+#   * AMD chip cTDP ............ 45-120 W (silicon, not the WIN 5 cooling)
+#   * GPD Motion Assistant ..... 8-75 W (their own shipped limit)
+#   * GPD rated sustainable .... 80-85 W (120 W only in short peaks)
+#   * Community sweet spot ..... 45-55 W (~95% of peak perf, sub-80C)
+#
+# So steps 1-9 cap at 75 W (GPD's own ceiling); step 10 goes to 85 W and is
+# flagged as "know what you're doing".
+#
+# Settings are NOT persistent — they reset on reboot (NixOS-native persistence
+# would be a systemd oneshot unit). Reading the live TDP needs the ryzen_smu
+# kernel module or root; if unavailable, `show` still prints the ladder.
+#
+# Usage:
+#   tdp              print the ladder + current step
+#   tdp show         same as above
+#   tdp set N        set step N (1-9 safe; 10 needs --force)   [needs root]
+#   tdp set N --force  override the safe-ceiling guard
+#   tdp N            shorthand for `set N`
+#   tdp up | down    step by one         [needs root]
+#   tdp watch        live power/temp readout (Ctrl-C to quit)
+#
+# Env overrides:
+#   TDP_RYZENADJ   path/command for ryzenadj (default: PATH, then nix run)
+#   TDP_SUDO       privilege helper (default: sudo -n, falls back to sudo)
+
+set -euo pipefail
+
+# ---- The ladder: step 1..10 -> watts -------------------------------------
+WATTS=(15 25 35 45 55 60 65 70 75 85)
+LABELS=(
+  "battery / idle, whisper quiet"
+  "light use, long battery"
+  "casual gaming, quiet"
+  "sweet spot (perf/watt/noise)"
+  "sweet spot ceiling"
+  "serious load"
+  "high sustained"
+  "near GPD ceiling"
+  "GPD Motion Assistant max"
+  "GPD sustainable max - monitor heat!"
+)
+CEILING_STEP=10   # steps >= this trigger a warning
+
+# ---- Helpers --------------------------------------------------------------
+
+c() { [[ -t 1 ]] && printf '\033[%sm' "$1" || true; }
+if [[ -t 1 ]]; then R=$'\033[0m'; BOLD=$'\033[1m'; GREY=$'\033[90m'; else R=""; BOLD=""; GREY=""; fi
+w() { printf 'tdp: %s\n' "$*" >&2; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# Resolve how to call ryzenadj (PATH first, else nix).
+ryzenadj_cmd() {
+  if [[ -n "${TDP_RYZENADJ:-}" ]]; then printf '%s' "$TDP_RYZENADJ"; return; fi
+  if have ryzenadj; then printf 'ryzenadj'; return; fi
+  printf 'nix run nixpkgs#ryzenadj --'
+}
+
+# Resolve a privilege helper. If already root, use none.
+priv() {
+  if [[ "$(id -u)" == "0" ]]; then return; fi
+  if [[ -n "${TDP_SUDO:-}" ]]; then printf '%s' "$TDP_SUDO"; return; fi
+  if sudo -n true 2>/dev/null; then printf 'sudo -n'; else printf 'sudo'; fi
+}
+
+watts_for() { local n=$1; echo "${WATTS[$((n-1))]}"; }
+label_for() { local n=$1; echo "${LABELS[$((n-1))]}"; }
+
+# Try to read the current sustained power limit in watts from ryzen_smu sysfs.
+read_current_watts() {
+  local f
+  for f in \
+    /sys/kernel/debug/ryzen_smu/metrics \
+    /sys/kernel/debug/amd_atl/* ; do
+    [[ -r "$f" ]] || continue
+    local v
+    v=$(grep -m1 -iE '^SLOW_LIMIT|PPT.*SLOW' "$f" 2>/dev/null || true)
+    [[ -n "$v" ]] || continue
+    # last numeric token is usually the mW value
+    local num
+    num=$(echo "$v" | grep -oE '[0-9]{4,}' | tail -1)
+    if [[ -n "$num" ]]; then echo $(( num / 1000 )); return 0; fi
+  done
+  return 1
+}
+
+# Which step is closest to the current watts (for highlighting)?
+step_for_watts() {
+  local cur=$1 best=1 bd=999 i d
+  for i in "${!WATTS[@]}"; do
+    d=$(( ${WATTS[$i]} > cur ? ${WATTS[$i]} - cur : cur - ${WATTS[$i]} ))
+    if (( d < bd )); then bd=$d; best=$(( i + 1 )); fi
+  done
+  echo "$best"
+}
+
+print_ladder() {
+  local cur curstep
+  cur=$(read_current_watts || true)
+  [[ -n "${cur:-}" ]] && curstep=$(step_for_watts "$cur") || curstep=""
+
+  echo
+  echo "  GPD WIN 5 · Strix Halo TDP ladder   $([ -n "${cur:-}" ] && echo "· currently ~${cur}W")"
+  echo "  ──────────────────────────────────────────────────────────"
+  local i w label marker color
+  for i in "${!WATTS[@]}"; do
+    w=${WATTS[$i]}; label=${LABELS[$i]}
+    step=$(( i + 1 ))
+    marker="  "
+    color=""
+    [[ "$step" == "$curstep" ]] && { marker="▸ "; color="$BOLD"; }
+    # visual bar: one block per 10W
+    local bar; bar=$(printf '%*s' $(( w / 10 )) '' | tr ' ' '#')
+    printf '  %s%s%2d  %3dW  %-28s %s%s%s\n' \
+      "$marker" "$color" "$step" "$w" "$label" \
+      "$GREY" "$bar" "$R"
+  done
+  echo
+  echo "  safe ceiling = GPD's own 75 W slider (step 9). step 10 = 85 W."
+  echo "  use the 180 W barrel brick; USB-C input caps the box ~65 W."
+  echo
+}
+
+do_set() {
+  local n=$1
+  if [[ ! "$n" =~ ^[1-9]|^10$ ]] || (( n < 1 || n > 10 )); then
+    w "step must be 1-10 (got: '$n')"; exit 2
+  fi
+  local w mw
+  w=$(watts_for "$n"); mw=$(( w * 1000 ))
+
+  # Steps at or above the ceiling need an explicit --force.
+  if (( n >= CEILING_STEP )) && [[ "${FORCE:-}" != "1" ]]; then
+    w "✗ step $n = ${w}W is above the safe ceiling (75W, GPD's own slider max)."
+    w "  Re-run with --force if you know what you're doing:"
+    w "    tdp set $n --force"
+    w "  Only ever do this plugged into the 180 W barrel brick, and watch"
+    w "  temps (Tjmax 100C). The WIN 5 cooling is rated 80-85 W sustainable."
+    exit 3
+  fi
+
+  local P; P=$(priv)
+  local RC; RC=$(ryzenadj_cmd)
+  # shellcheck disable=SC2086
+  local cmd=( $RC --stapm-limit="$mw" --slow-limit="$mw" --fast-limit="$mw" )
+  echo "+ $P ${cmd[*]}" >&2
+  # shellcheck disable=SC2068
+  $P "${cmd[@]}"
+  w "✔ set to ${w}W (step $n) — $(label_for "$n")"
+  w "  (resets on reboot)"
+}
+
+do_up()   { local s; s=$(cur_step); (( s < 10 )) && do_set $(( s + 1 )) || w "already at max (10)"; }
+do_down() { local s; s=$(cur_step); (( s > 1 ))  && do_set $(( s - 1 )) || w "already at min (1)"; }
+
+cur_step() {
+  local cur; cur=$(read_current_watts || true)
+  [[ -n "${cur:-}" ]] && { step_for_watts "$cur"; return; }
+  echo 5   # conservative middle when unknown
+}
+
+do_watch() {
+  # Poll hwmon directly: k10temp (Tctl) + amdgpu (power draw, VRAM). No deps.
+  local k="" gpu="" h
+  for h in /sys/class/hwmon/hwmon*; do
+    case "$(cat "$h/name" 2>/dev/null)" in
+      k10temp) [[ -z "$k" ]] && k="$h" ;;
+      amdgpu)  [[ -z "$gpu" ]] && gpu="$h" ;;
+    esac
+  done
+  [[ -n "$k" ]] || { w "no k10temp hwmon found"; exit 1; }
+  w "live readout — Ctrl-C to quit"
+  while :; do
+    local t gpw vram cur
+    t=$(awk '{printf "%.0f", $1/1000}' "$k/temp1_input" 2>/dev/null || echo ?)
+    gpw=$(awk '{printf "%.1f", $1/1000000}' "$gpu/power1_average" 2>/dev/null | head -1 || echo ?)
+    vram=$(awk '{printf "%.1f", $1/1073741824}' "$gpu/device/mem_info_vram_used" 2>/dev/null || echo ?)
+    cur=$(read_current_watts || echo "?")
+    local heat="ok"
+    if [[ "$t" =~ ^[0-9]+$ ]] && (( t >= 95 )); then heat="HOT"; fi
+    [[ -t 1 ]] && clear
+    echo "SoC limit: ${cur}W   Tctl: ${t}C ${heat}   GPU: ${gpw}W   VRAM: ${vram}G"
+    echo "──────────────────────────────────────────────────"
+    print_ladder
+    sleep 1
+  done
+}
+
+# ---- Entry ----------------------------------------------------------------
+# Strip a --force flag from anywhere in the args (sets FORCE=1).
+FORCE="${FORCE:-0}"
+args=()
+for a in "$@"; do
+  if [[ "$a" == "--force" ]]; then FORCE=1; else args+=("$a"); fi
+done
+set -- "${args[@]+"${args[@]}"}"
+
+case "${1:-show}" in
+  show|"") print_ladder ;;
+  set)     do_set "${2:-}" ;;
+  up)      do_up ;;
+  down)    do_down ;;
+  watch)   do_watch ;;
+  -h|--help|help)
+    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//' ;;
+  [1-9]|10) do_set "$1" ;;
+  *) w "unknown command: $1 (try: tdp help)"; exit 2 ;;
+esac
