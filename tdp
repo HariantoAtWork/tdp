@@ -14,12 +14,12 @@
 # So steps 1-9 cap at 75 W (GPD's own ceiling); step 10 goes to 85 W and is
 # flagged as "know what you're doing".
 #
-# Settings are NOT persistent — they reset on reboot (NixOS-native persistence
-# would be a systemd oneshot unit). Reading the live TDP needs the ryzen_smu
-# kernel module or root; if unavailable, `show` still prints the ladder.
+# Settings are NOT persistent across reboot unless a boot oneshot is installed
+# (see install.sh). Live TDP reads need ryzen_smu / privileged ryzenadj -i;
+# when those fail, `show` falls back to the last step written by `set`.
 #
 # Usage:
-#   tdp              print the ladder + current step
+#   tdp              print the ladder + current / last-set step
 #   tdp show         same as above
 #   tdp set N        set step N (1-9 safe; 10 needs --force)   [needs root]
 #   tdp set N --force  override the safe-ceiling guard
@@ -30,6 +30,7 @@
 # Env overrides:
 #   TDP_RYZENADJ   path/command for ryzenadj (default: PATH, then nix run)
 #   TDP_SUDO       privilege helper (default: sudo -n, falls back to sudo)
+#   TDP_STATE      path for last-set step file (default: /var/lib/tdp/step)
 
 set -euo pipefail
 
@@ -48,6 +49,7 @@ LABELS=(
   "GPD sustainable max - monitor heat!"
 )
 CEILING_STEP=10   # steps >= this trigger a warning
+STATE_FILE="${TDP_STATE:-/var/lib/tdp/step}"
 
 # ---- Helpers --------------------------------------------------------------
 
@@ -56,6 +58,23 @@ if [[ -t 1 ]]; then R=$'\033[0m'; BOLD=$'\033[1m'; GREY=$'\033[90m'; else R=""; 
 w() { printf 'tdp: %s\n' "$*" >&2; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# Persist / recall the step last applied by `tdp set` (survives until reboot
+# of the SMU limits themselves; file may outlive that — labelled as "last set").
+save_step() {
+  local n=$1 dir
+  dir=$(dirname "$STATE_FILE")
+  mkdir -p "$dir" 2>/dev/null || return 0
+  printf '%s\n' "$n" >"$STATE_FILE" 2>/dev/null || true
+}
+
+load_step() {
+  local n
+  [[ -r "$STATE_FILE" ]] || return 1
+  n=$(tr -dc '0-9' <"$STATE_FILE" | head -c 2)
+  [[ "$n" =~ ^([1-9]|10)$ ]] || return 1
+  echo "$n"
+}
 
 # Resolve how to call ryzenadj (PATH first, else nix).
 ryzenadj_cmd() {
@@ -74,7 +93,8 @@ priv() {
 watts_for() { local n=$1; echo "${WATTS[$((n-1))]}"; }
 label_for() { local n=$1; echo "${LABELS[$((n-1))]}"; }
 
-# Try to read the current sustained power limit in watts from ryzen_smu sysfs.
+# Try to read the current sustained power limit in watts.
+# Prefer sysfs (ryzen_smu); fall back to privileged `ryzenadj -i`.
 read_current_watts() {
   local f
   for f in \
@@ -89,6 +109,27 @@ read_current_watts() {
     num=$(echo "$v" | grep -oE '[0-9]{4,}' | tail -1)
     if [[ -n "$num" ]]; then echo $(( num / 1000 )); return 0; fi
   done
+
+  # ryzenadj --info prints STAPM / PPT LIMIT SLOW in mW when the metric table
+  # is available. Only try when already root or passwordless sudo — never
+  # prompt on a plain `tdp show`.
+  local RC out line num helper=""
+  if [[ "$(id -u)" == "0" ]]; then
+    helper=""
+  elif [[ -n "${TDP_SUDO:-}" ]]; then
+    helper=$TDP_SUDO
+  elif sudo -n true 2>/dev/null; then
+    helper="sudo -n"
+  else
+    return 1
+  fi
+  RC=$(ryzenadj_cmd)
+  # shellcheck disable=SC2086
+  if out=$($helper $RC -i 2>/dev/null); then
+    line=$(echo "$out" | grep -im1 -E 'PPT LIMIT SLOW|STAPM LIMIT' || true)
+    num=$(echo "$line" | grep -oE '[0-9]{4,}' | head -1)
+    if [[ -n "${num:-}" ]]; then echo $(( num / 1000 )); return 0; fi
+  fi
   return 1
 }
 
@@ -103,12 +144,22 @@ step_for_watts() {
 }
 
 print_ladder() {
-  local cur curstep
+  local cur curstep status="" source=""
   cur=$(read_current_watts || true)
-  [[ -n "${cur:-}" ]] && curstep=$(step_for_watts "$cur") || curstep=""
+  if [[ -n "${cur:-}" ]]; then
+    curstep=$(step_for_watts "$cur")
+    source=live
+    status="· currently ~${cur}W (step ${curstep})"
+  elif curstep=$(load_step); then
+    source=saved
+    status="· last set: step ${curstep} ($(watts_for "$curstep")W)"
+  else
+    curstep=""
+    status="· current unknown (no SMU metrics / no last set)"
+  fi
 
   echo
-  echo "  GPD WIN 5 · Strix Halo TDP ladder   $([ -n "${cur:-}" ] && echo "· currently ~${cur}W")"
+  echo "  GPD WIN 5 · Strix Halo TDP ladder   ${status}"
   echo "  ──────────────────────────────────────────────────────────"
   local i w label marker color
   for i in "${!WATTS[@]}"; do
@@ -116,7 +167,7 @@ print_ladder() {
     step=$(( i + 1 ))
     marker="  "
     color=""
-    [[ "$step" == "$curstep" ]] && { marker="▸ "; color="$BOLD"; }
+    [[ -n "$curstep" && "$step" == "$curstep" ]] && { marker="▸ "; color="$BOLD"; }
     # visual bar: one block per 10W
     local bar; bar=$(printf '%*s' $(( w / 10 )) '' | tr ' ' '#')
     printf '  %s%s%2d  %3dW  %-28s %s%s%s\n' \
@@ -124,6 +175,9 @@ print_ladder() {
       "$GREY" "$bar" "$R"
   done
   echo
+  if [[ "$source" == "saved" ]]; then
+    echo "  (highlighted from last \`tdp set\` — live SMU read unavailable)"
+  fi
   echo "  safe ceiling = GPD's own 75 W slider (step 9). step 10 = 85 W."
   echo "  use the 180 W barrel brick; USB-C input caps the box ~65 W."
   echo
@@ -154,6 +208,7 @@ do_set() {
   echo "+ $P ${cmd[*]}" >&2
   # shellcheck disable=SC2068
   $P "${cmd[@]}"
+  save_step "$n"
   w "✔ set to ${w}W (step $n) — $(label_for "$n")"
   w "  (resets on reboot)"
 }
@@ -162,8 +217,10 @@ do_up()   { local s; s=$(cur_step); (( s < 10 )) && do_set $(( s + 1 )) || w "al
 do_down() { local s; s=$(cur_step); (( s > 1 ))  && do_set $(( s - 1 )) || w "already at min (1)"; }
 
 cur_step() {
-  local cur; cur=$(read_current_watts || true)
+  local cur s
+  cur=$(read_current_watts || true)
   [[ -n "${cur:-}" ]] && { step_for_watts "$cur"; return; }
+  if s=$(load_step); then echo "$s"; return; fi
   echo 5   # conservative middle when unknown
 }
 

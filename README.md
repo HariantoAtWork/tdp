@@ -93,7 +93,7 @@ GPD's sustainable ceiling and needs `--force`.
 ## Usage
 
 ```bash
-tdp              # print the ladder
+tdp              # print the ladder + highlight current / last-set step
 tdp show         # same
 tdp set 5        # jump to step 5 (55 W)
 tdp 5            # shorthand
@@ -103,6 +103,10 @@ tdp set 10       # ✗ refused (above safe ceiling)
 tdp set 10 --force   # ✔ apply 85 W deliberately
 tdp watch        # live Tctl / GPU-watt / VRAM readout
 ```
+
+`tdp` / `tdp show` marks the active step with `▸`. Prefer live SMU watts
+(`ryzen_smu` or `ryzenadj -i`); if those are unavailable it falls back to the
+last step written by `tdp set` (`/var/lib/tdp/step`).
 
 ## How it works
 
